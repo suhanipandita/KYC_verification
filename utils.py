@@ -2,42 +2,38 @@ import streamlit as st
 import cv2
 import numpy as np
 import re
+import difflib
+import gzip
 import easyocr
 import pytesseract
+from pyzbar.pyzbar import decode
 from supabase import create_client, Client
-from ocr_engine import OCREngine  # Import class directly
-
-# --- 1. SETUP & INITIALIZATION ---
-
-# Initialize OCR Engine locally (Prevents 'backend' attribute errors)
-ocr_engine = OCREngine()
 
 # Initialize Supabase
 supabase: Client = None
 try:
-    # Try loading from secrets.toml
     SUPABASE_URL = st.secrets["supabase"]["url"]
     SUPABASE_KEY = st.secrets["supabase"]["key"]
-    
     if "YOUR_SUPABASE" not in SUPABASE_URL:
         supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 except Exception:
-    # Fail silently if secrets aren't set up yet (prevents app crash on startup)
     pass
 
-# --- 2. DATABASE FUNCTIONS ---
-
-def log_to_db(track, status, name, pan_number, score, forensic, result):
+# --- UPDATED LOGGING FUNCTION ---
+def log_to_db(track, status, id_name, aadhar_name, qr_name, aadhar_number, score, forensic, result, meta_json):
     if supabase:
         try:
             data = {
                 "track_type": track,
                 "user_status": status,
-                "extracted_name": name,
-                "pan_number": pan_number if pan_number else "N/A",
+                "extracted_name": id_name,         # Name from ID/Offer Letter
+                "aadhar_name": aadhar_name,        # Name found on Aadhaar Card Text
+                "qr_name": qr_name,                # Name from QR
+                "aadhar_number": aadhar_number,    # 12-digit Number from OCR
                 "face_match_score": float(score) if score else 0.0,
                 "forensic_status": forensic,
-                "final_result": result
+                "final_result": result,
+                "verification_meta": meta_json     # New JSON Format
             }
             supabase.table("verification_logs").insert(data).execute()
             return True
@@ -46,98 +42,115 @@ def log_to_db(track, status, name, pan_number, score, forensic, result):
             return False
     return False
 
-# --- 3. PAN EXTRACTION LOGIC ---
-
-def smart_correct_pan(raw_text):
+# --- 1. EXTRACT NAME FROM CARD (TEXT) ---
+def check_name_on_card(image_path, target_name):
     """
-    Advanced correction logic.
-    Forces characters into strictly Letters or Digits based on position.
+    Scans the Aadhaar Card text (OCR) and checks if the 'target_name' (from QR)
+    is present on the card.
     """
-    # Remove whitespace
-    raw_text = re.sub(r'[\s\n\r]', '', raw_text).upper()
-    
-    # 1. Strict Regex (If perfect, return immediately)
-    if re.search(r'^[A-Z]{5}[0-9]{4}[A-Z]$', raw_text):
-        return raw_text
+    if not target_name: return False, "QR Name Missing"
 
-    # 2. Loose Search (Find the 10-char block)
-    match = re.search(r'([A-Z0-9]{5})([0-9OIZSBL]{4})([A-Z0-9])', raw_text)
-    
-    if match:
-        part1, part2, part3 = match.groups()
-        
-        # FIX PART 1 (First 5 chars -> LETTERS)
-        p1_map = {'0': 'O', '1': 'I', '2': 'Z', '5': 'S', '8': 'B', '6': 'G'}
-        fixed_p1 = "".join([p1_map.get(c, c) if c.isdigit() else c for c in part1])
-        
-        # FIX PART 2 (Next 4 chars -> DIGITS)
-        p2_map = {'O': '0', 'D': '0', 'Q': '0', 'I': '1', 'L': '1', 'Z': '2', 'S': '5', 'B': '8', 'A': '4'}
-        fixed_p2 = "".join([p2_map.get(c, c) if c.isalpha() else c for c in part2])
-        
-        # FIX PART 3 (Last char -> LETTER)
-        fixed_p3 = "".join([p1_map.get(c, c) if c.isdigit() else c for c in part3])
-        
-        return f"{fixed_p1}{fixed_p2}{fixed_p3}"
-    
-    return "NOT FOUND"
+    # Normalize target name (Remove spaces, special chars)
+    clean_target = re.sub(r'[^A-Z]', '', target_name.upper())
 
-def process_image_modes(image_path):
-    """Generates 3 versions of the image to maximize OCR success."""
-    img = cv2.imread(image_path)
-    if img is None: return []
+    # Helper to clean OCR text lines
+    def clean(text): return re.sub(r'[^A-Z]', '', text.upper())
 
-    processed_images = []
+    # 1. Try EasyOCR
+    try:
+        reader = easyocr.Reader(['en'])
+        results = reader.readtext(image_path, detail=0)
+        for line in results:
+            # Fuzzy match the line against the target name
+            if difflib.SequenceMatcher(None, clean(line), clean_target).ratio() > 0.85:
+                return True, line # Return the text we found that matched
+    except: pass
 
-    # MODE 1: Standard Cleaning
-    processed_images.append(ocr_engine.clean_image(image_path))
+    # 2. Try Tesseract
+    try:
+        img = cv2.imread(image_path)
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        text = pytesseract.image_to_string(gray)
+        for line in text.split('\n'):
+            if difflib.SequenceMatcher(None, clean(line), clean_target).ratio() > 0.85:
+                return True, line
+    except: pass
 
-    # MODE 2: Aggressive Binary Thresholding
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    processed_images.append(binary)
+    return False, "Not Found"
 
-    # MODE 3: Zoom (3x) + Sharpening
-    h, w = gray.shape
-    zoomed = cv2.resize(gray, (w*3, h*3), interpolation=cv2.INTER_CUBIC)
-    kernel = np.array([[0, -1, 0], [-1, 5,-1], [0, -1, 0]])
-    sharpened = cv2.filter2D(zoomed, -1, kernel)
-    _, sharp_bin = cv2.threshold(sharpened, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    processed_images.append(sharp_bin)
+# --- 2. EXTRACT AADHAAR NUMBER ---
+def smart_correct_digits(text):
+    text = text.upper()
+    corrections = {'O': '0', 'D': '0', 'Q': '0', 'I': '1', 'L': '1', 'Z': '2', 'S': '5', 'B': '8'}
+    return "".join([corrections.get(c, c) for c in text])
 
-    return processed_images
+def extract_aadhar_number_ocr(image_path):
+    def find_uid(text):
+        clean_text = smart_correct_digits(text)
+        match = re.search(r'\b(\d{4}\s\d{4}\s\d{4})\b', clean_text)
+        if match: return match.group(1).replace(" ", "")
+        match_loose = re.search(r'\b(\d{12})\b', clean_text.replace(" ", ""))
+        if match_loose: return match_loose.group(1)
+        return None
 
-def extract_pan_number_robust(image_path):
-    """
-    Multi-Pass Extraction: Tries Tesseract & EasyOCR on 3 different image modes.
-    """
-    # 1. Try EasyOCR on Raw Image first
     try:
         reader = easyocr.Reader(['en'])
         result = reader.readtext(image_path, detail=0)
-        full_text = "".join(result)
-        candidate = smart_correct_pan(full_text)
-        if candidate != "NOT FOUND":
-            return candidate
-    except:
-        pass
+        uid = find_uid(" ".join(result))
+        if uid: return uid
+    except: pass
+    
+    try:
+        img = cv2.imread(image_path)
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        text = pytesseract.image_to_string(gray, config='--psm 6')
+        uid = find_uid(text)
+        if uid: return uid
+    except: pass
+    return None
 
-    # 2. Get 3 Processed Versions
-    mode_images = process_image_modes(image_path)
+# --- 3. EXTRACT QR DATA ---
+def decode_secure_qr(qr_data_str):
+    try:
+        data_int = int(qr_data_str)
+        byte_len = (data_int.bit_length() + 7) // 8
+        data_bytes = data_int.to_bytes(byte_len, 'big')
+        decompressed_data = gzip.decompress(data_bytes)
+        text_data = decompressed_data.decode("ISO-8859-1")
+        parts = text_data.split("\xff")
+        name = parts[3] if len(parts) > 3 else None
+        return name
+    except: return None
 
-    for i, proc_img in enumerate(mode_images):
-        if proc_img is None: continue
-        
-        # Try Tesseract with different segmentation modes
-        for psm in [6, 11, 3]:
-            try:
-                text = pytesseract.image_to_string(
-                    proc_img, 
-                    config=f'--psm {psm} -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
-                )
-                candidate = smart_correct_pan(text)
-                if candidate != "NOT FOUND":
-                    return candidate
-            except:
-                continue
+def extract_aadhar_qr_name(image_path):
+    """Only returns the Name from the QR."""
+    img = cv2.imread(image_path)
+    if img is None: return None
 
-    return "NOT FOUND"
+    decoded_objects = decode(img)
+    if not decoded_objects:
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        decoded_objects = decode(gray)
+
+    for obj in decoded_objects:
+        try:
+            raw_data = obj.data.decode("utf-8")
+            # Old XML
+            if "name=" in raw_data:
+                match = re.search(r'name="([^"]+)"', raw_data)
+                if match: return match.group(1)
+            # Secure QR
+            elif raw_data.isdigit():
+                return decode_secure_qr(raw_data)
+        except: continue
+    return None
+
+# --- 4. NAME COMPARISON ---
+def verify_name_match(name1, name2):
+    if not name1 or not name2: return 0.0, False
+    n1 = re.sub(r'[^A-Z\s]', '', name1.upper()).strip()
+    n2 = re.sub(r'[^A-Z\s]', '', name2.upper()).strip()
+    n1_sorted = " ".join(sorted(n1.split()))
+    n2_sorted = " ".join(sorted(n2.split()))
+    score = difflib.SequenceMatcher(None, n1_sorted, n2_sorted).ratio() * 100
+    return score, score >= 80
