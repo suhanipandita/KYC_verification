@@ -48,24 +48,26 @@ def emoji_rain(emoji_text, count=30, size=50):
     st.components.v1.html(js_code, height=0)
 
 st.title("═ KYC Master System ═")
-st.markdown("### 🇮🇳 Name-Based Aadhaar Verification")
+st.markdown("### 🇮🇳 Biometric First Verification")
 
 track = st.sidebar.radio("Select Track:", ("Track 1: Standard Employee", "Track 2: Startup Employee"))
 
-# --- TRACK 1 ---
+# ==========================================
+# TRACK 1
+# ==========================================
 if track == "Track 1: Standard Employee":
     st.header("Track 1: Employee Verification")
     
     selfie_file = st.camera_input("1. Take Live Selfie")
     id_file = st.file_uploader("2. Upload Employee ID", type=['jpg', 'png'])
     st.divider()
+    use_aadhar = st.checkbox("Verify with Aadhaar (Verified User)", value=False)
     
-    use_aadhar = st.checkbox("Verify with Aadhaar", value=False)
     af_file, ab_file = None, None
     if use_aadhar:
         col1, col2 = st.columns(2)
-        with col1: af_file = st.file_uploader("Front (Photo)", type=['jpg', 'png'], key="af1")
-        with col2: ab_file = st.file_uploader("Back (QR)", type=['jpg', 'png'], key="ab1")
+        with col1: af_file = st.file_uploader("Front", type=['jpg', 'png'], key="af1")
+        with col2: ab_file = st.file_uploader("Back", type=['jpg', 'png'], key="ab1")
 
     if st.button("Run Verification", type="primary"):
         if not selfie_file or not id_file:
@@ -80,109 +82,93 @@ if track == "Track 1: Standard Employee":
 
             try:
                 with st.status("Processing...", expanded=True) as status:
-                    # 1. ID Extraction
-                    status.write("🔹 Scanning ID...")
-                    clean_id = backend.ocr_engine.clean_image(id_card)
-                    id_data = backend.ocr_engine.extract_universal_data(clean_id)
-                    id_name = str(id_data.get("name", "NOT FOUND")).upper().strip()
-                    st.write(f"**ID Name:** `{id_name}`")
-
-                    # 2. Biometrics
+                    
+                    # 1. CHECK BIOMETRICS FIRST (CRITICAL GATE)
+                    status.write("🔹 Checking Face Match (Selfie vs ID)...")
                     emb_s = backend.get_face_embedding(selfie)
                     emb_id = backend.get_face_embedding(id_card)
-                    score = 0.0
-                    if emb_s is not None and emb_id is not None:
-                        score = cosine_similarity(emb_s, emb_id)[0][0]
                     
-                    if score >= 0.50:
+                    id_score = 0.0
+                    face_passed = False
+                    if emb_s is not None and emb_id is not None:
+                        id_score = cosine_similarity(emb_s, emb_id)[0][0]
+                        st.write(f"**ID Match Score:** `{id_score:.3f}`")
+                        if id_score >= 0.50: face_passed = True
+                    
+                    if not face_passed:
+                        # FAIL IMMEDIATELY
+                        st.error("❌ Face Mismatch (Selfie vs ID). Verification Stopped.")
+                        # ID name unknown here as we prioritized face, extract just for logging?
+                        # Or log as 'Unknown'
+                        utils.log_to_db("Track 1", "FAILED", "Unknown", id_score, "Skipped", "Face Mismatch", {})
+                    
+                    else:
+                        # FACE PASSED -> NOW DO OCR/DATA
+                        status.write("🔹 Face Matched! Extracting Data...")
+                        
+                        clean_id = backend.ocr_engine.clean_image(id_card)
+                        id_data = backend.ocr_engine.extract_universal_data(clean_id)
+                        id_name = str(id_data.get("name", "NOT FOUND")).upper().strip()
+                        st.write(f"**ID Name:** `{id_name}`")
+
+                        # --- NORMAL USER ---
                         if not use_aadhar:
+                            status.update(label="Complete!", state="complete")
                             emoji_rain("👍")
-                            st.success("✅ **NORMAL USER**")
-                            # JSON: Not Verified
-                            res_json = {"aadhar_name": "", "qr_name": "", "aadhar_number": None, "verified": "no"}
-                            utils.log_to_db("Track 1", "NORMAL", id_name, "", "", "", score, "Skipped", "APPROVED", res_json)
+                            st.success("✅ Access Granted: **NORMAL USER**")
+                            utils.log_to_db("Track 1", "NORMAL", id_name, id_score, "Skipped", "APPROVED", {})
+                        
+                        # --- VERIFIED USER (AADHAAR) ---
                         else:
-                            status.write("🔹 Checking Aadhaar (Name Consistency)...")
+                            # 2. CHECK AADHAAR FACE MATCH
+                            status.write("🔹 Checking Aadhaar Face...")
+                            target = af if af else ab
+                            emb_a = backend.get_face_embedding(target)
                             
-                            # A. Extract QR Name
-                            qr_name = None
-                            if af: qr_name = utils.extract_aadhar_qr_name(af)
-                            if not qr_name and ab: qr_name = utils.extract_aadhar_qr_name(ab)
+                            a_score = 0.0
+                            aadhar_face_pass = False
+                            if emb_a is not None:
+                                a_score = cosine_similarity(emb_s, emb_a)[0][0]
+                                st.write(f"**Aadhaar Match Score:** `{a_score:.3f}`")
+                                if a_score >= 0.50: aadhar_face_pass = True
                             
-                            # B. Extract Aadhaar Number (OCR)
-                            aadhaar_num = None
-                            if af: aadhaar_num = utils.extract_aadhar_number_ocr(af)
-
-                            # C. Check Name on Card (OCR vs QR Name)
-                            found_on_card = False
-                            aadhar_text_name = "Not Found"
-                            
-                            if qr_name and af:
-                                found_on_card, aadhar_text_name = utils.check_name_on_card(af, qr_name)
-                            
-                            st.write(f"**QR Name:** `{qr_name}`")
-                            st.write(f"**Name on Card:** `{aadhar_text_name}`")
-                            st.write(f"**Aadhaar No:** `{aadhaar_num}`")
-
-                            # LOGIC: 
-                            # 1. QR Name must match Card Text Name
-                            # 2. QR Name must match ID Name
-                            
-                            internal_match = found_on_card
-                            id_vs_qr_match = False
-                            if qr_name:
-                                _, id_vs_qr_match = utils.verify_name_match(id_name, qr_name)
-
-                            # Build JSON Result
-                            verified_status = "no"
-                            final_result = "REJECTED"
-                            
-                            if internal_match and id_vs_qr_match:
-                                verified_status = "yes"
-                                final_result = "APPROVED"
-                                st.success("✅ Names Matched (ID = QR = Card)")
+                            if not aadhar_face_pass:
+                                st.error("❌ Aadhaar Face Mismatch. Verification Stopped.")
+                                utils.log_to_db("Track 1", "FAILED", id_name, a_score, "Skipped", "Face Mismatch", {})
+                            else:
+                                # 3. CHECK NAMES (ONLY IF FACE PASSED)
+                                status.write("🔹 Faces Matched! Checking Names...")
                                 
-                                # Final Face Check
-                                target = af if af else ab
-                                emb_a = backend.get_face_embedding(target)
-                                a_score = 0.0
-                                if emb_a is not None:
-                                    a_score = cosine_similarity(emb_s, emb_a)[0][0]
+                                details = utils.get_aadhar_details(af, ab)
+                                qr_name = details['qr_name']
+                                st.write(f"**QR Name:** `{qr_name}`")
                                 
-                                if a_score >= 0.50:
+                                n_score, n_match = utils.verify_name_match(id_name, qr_name)
+                                
+                                if n_match:
                                     emoji_rain("🌟")
                                     st.success("✅ **VERIFIED USER**")
+                                    utils.log_to_db("Track 1", "VERIFIED", id_name, a_score, "Passed", "APPROVED", details)
                                 else:
-                                    st.error("❌ Face Mismatch")
-                                    final_result = "REJECTED"
-                            else:
-                                if not internal_match: st.error("❌ Mismatch: QR Name not found on Card Text")
-                                if not id_vs_qr_match: st.error("❌ Mismatch: ID Name vs Aadhaar Name")
-                            
-                            # FINAL JSON STRUCTURE
-                            res_json = {
-                                "aadhar_name": aadhar_text_name,
-                                "qr_name": qr_name if qr_name else "Not Found",
-                                "aadhar_number": aadhaar_num,
-                                "verified": verified_status
-                            }
-                            
-                            utils.log_to_db("Track 1", "VERIFIED" if verified_status=="yes" else "FAILED", 
-                                          id_name, aadhar_text_name, qr_name, aadhaar_num, a_score if 'a_score' in locals() else 0.0, 
-                                          "Passed", final_result, res_json)
+                                    st.error("❌ Name Mismatch (ID vs QR)")
+                                    utils.log_to_db("Track 1", "FAILED", id_name, a_score, "Name Mismatch", "REJECTED", details)
 
             finally:
                 for p in [selfie, id_card, af, ab]:
                     if p and os.path.exists(p): os.remove(p)
 
-# --- TRACK 2 ---
+
+# ==========================================
+# TRACK 2
+# ==========================================
 elif track == "Track 2: Startup Employee":
-    # (Simplified for brevity, same logic as above but with Offer Letter)
     st.header("Track 2: Startup Verification")
+    
     selfie_file = st.camera_input("1. Take Live Selfie")
     offer_file = st.file_uploader("2. Upload Offer Letter", type=['jpg', 'png'])
     st.divider()
-    use_aadhar = st.checkbox("Verify with Aadhaar", value=False)
+    use_aadhar = st.checkbox("Verify with Aadhaar (Verified User)", value=False)
+    
     af_file, ab_file = None, None
     if use_aadhar:
         col1, col2 = st.columns(2)
@@ -192,6 +178,8 @@ elif track == "Track 2: Startup Employee":
     if st.button("Run Verification", type="primary"):
         if not selfie_file or not offer_file:
             st.warning("⚠️ Input missing.")
+        elif use_aadhar and not (af_file or ab_file):
+            st.warning("⚠️ Aadhaar required.")
         else:
             selfie = save_uploaded_file(selfie_file)
             offer = save_uploaded_file(offer_file)
@@ -200,68 +188,68 @@ elif track == "Track 2: Startup Employee":
 
             try:
                 with st.status("Processing...", expanded=True) as status:
-                    # Forensics... (Keep existing logic)
-                    status.write("🔹 Checking Forensics...")
-                    st.success("✅ Forensics Passed (Simulated)")
                     
-                    # Name Extract
-                    reader = backend.easyocr.Reader(['en'])
-                    res = reader.readtext(offer)
-                    lines = [r[1].upper() for r in res]
-                    offer_name = "NOT FOUND"
-                    for i, l in enumerate(lines):
-                        if "TO" in l and i+1 < len(lines):
-                            offer_name = lines[i+1].strip()
-                            break
-                    st.write(f"**Offer Name:** `{offer_name}`")
-
-                    if not use_aadhar:
-                         utils.log_to_db("Track 2", "NORMAL", offer_name, "", "", "", 0.0, "Passed", "APPROVED", 
-                                        {"aadhar_name": "", "qr_name": "", "aadhar_number": None, "verified": "no"})
-                         emoji_rain("👍")
-                         st.success("✅ **NORMAL USER**")
+                    # 1. FORENSICS (Required for Track 2)
+                    status.write("🔹 Checking Forensics...")
+                    # ... [Insert Forensic Logic Here] ... 
+                    # Assuming Pass for simplicity:
+                    forensics_passed = True 
+                    
+                    if not forensics_passed:
+                        st.error("❌ Forensics Failed")
                     else:
-                        # Aadhaar Check
-                        qr_name = None
-                        if af: qr_name = utils.extract_aadhar_qr_name(af)
-                        if not qr_name and ab: qr_name = utils.extract_aadhar_qr_name(ab)
-                        
-                        aadhaar_num = None
-                        if af: aadhaar_num = utils.extract_aadhar_number_ocr(af)
+                        # Extract Offer Name
+                        reader = backend.easyocr.Reader(['en'])
+                        res = reader.readtext(offer)
+                        lines = [r[1].upper() for r in res]
+                        offer_name = "NOT FOUND"
+                        for i, l in enumerate(lines):
+                            if "TO" in l and i+1 < len(lines):
+                                offer_name = lines[i+1].strip()
+                                break
+                        st.write(f"**Offer Name:** `{offer_name}`")
 
-                        found_on_card = False
-                        aadhar_text_name = "Not Found"
-                        if qr_name and af:
-                            found_on_card, aadhar_text_name = utils.check_name_on_card(af, qr_name)
+                        # --- NORMAL USER (NO FACE CHECK) ---
+                        if not use_aadhar:
+                            emoji_rain("👍")
+                            st.success("✅ **NORMAL USER** (Docs Only)")
+                            utils.log_to_db("Track 2", "NORMAL", offer_name, 0.0, "Passed", "APPROVED", {})
 
-                        st.write(f"**QR Name:** `{qr_name}`")
-                        st.write(f"**Name on Card:** `{aadhar_text_name}`")
-
-                        internal_match = found_on_card
-                        offer_vs_qr_match = False
-                        if qr_name:
-                            _, offer_vs_qr_match = utils.verify_name_match(offer_name, qr_name)
-                        
-                        verified_status = "no"
-                        final_result = "REJECTED"
-                        
-                        if internal_match and offer_vs_qr_match:
-                             verified_status = "yes"
-                             final_result = "APPROVED"
-                             st.success("✅ Names Matched")
-                             emoji_rain("🌟")
+                        # --- VERIFIED USER (AADHAAR FACE CHECK) ---
                         else:
-                             st.error("❌ Verification Failed")
+                            # 1. BIOMETRIC CHECK FIRST
+                            status.write("🔹 Checking Aadhaar Face...")
+                            target = af if af else ab
+                            emb_s = backend.get_face_embedding(selfie)
+                            emb_a = backend.get_face_embedding(target)
+                            
+                            a_score = 0.0
+                            face_passed = False
+                            if emb_s is not None and emb_a is not None:
+                                a_score = cosine_similarity(emb_s, emb_a)[0][0]
+                                st.write(f"**Face Match Score:** `{a_score:.3f}`")
+                                if a_score >= 0.50: face_passed = True
+                            
+                            if not face_passed:
+                                st.error("❌ Face Mismatch (Selfie vs Aadhaar). Stopped.")
+                                utils.log_to_db("Track 2", "FAILED", offer_name, a_score, "Face Mismatch", "REJECTED", {})
+                            else:
+                                # 2. NAME CHECK
+                                status.write("🔹 Checking Names...")
+                                details = utils.get_aadhar_details(af, ab)
+                                qr_name = details['qr_name']
+                                st.write(f"**QR Name:** `{qr_name}`")
+                                
+                                n_score, n_match = utils.verify_name_match(offer_name, qr_name)
+                                
+                                if n_match:
+                                    emoji_rain("🌟")
+                                    st.success("✅ **VERIFIED USER**")
+                                    utils.log_to_db("Track 2", "VERIFIED", offer_name, a_score, "Passed", "APPROVED", details)
+                                else:
+                                    st.error("❌ Name Mismatch")
+                                    utils.log_to_db("Track 2", "FAILED", offer_name, a_score, "Name Mismatch", "REJECTED", details)
 
-                        res_json = {
-                            "aadhar_name": aadhar_text_name,
-                            "qr_name": qr_name if qr_name else "Not Found",
-                            "aadhar_number": aadhaar_num,
-                            "verified": verified_status
-                        }
-                        utils.log_to_db("Track 2", "VERIFIED" if verified_status=="yes" else "FAILED", 
-                                          offer_name, aadhar_text_name, qr_name, aadhaar_num, 0.0, 
-                                          "Passed", final_result, res_json)
             finally:
                 for p in [selfie, offer, af, ab]:
                     if p and os.path.exists(p): os.remove(p)
