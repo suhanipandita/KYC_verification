@@ -10,4 +10,5 @@ facenet-pytorch
 easyocr
 pytesseract
 Pillow
-supabase
+pymongo
+certifi

@@ -7,46 +7,60 @@ import gzip
 import easyocr
 import pytesseract
 from pyzbar.pyzbar import decode
-from supabase import create_client, Client
+from pymongo import MongoClient
+import certifi
+from datetime import datetime
 
-# Initialize Supabase
-supabase: Client = None
-try:
-    SUPABASE_URL = st.secrets["supabase"]["url"]
-    SUPABASE_KEY = st.secrets["supabase"]["key"]
-    if "YOUR_SUPABASE" not in SUPABASE_URL:
-        supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-except Exception:
-    pass
+# --- MONGODB CONNECTION SETUP ---
+# We use st.cache_resource so we don't reconnect on every rerun
+@st.cache_resource
+def get_mongo_client():
+    try:
+        uri = st.secrets["mongodb"]["uri"]
+        # ca=certifi.where() is critical for SSL connections on some networks
+        client = MongoClient(uri, tlsCAFile=certifi.where())
+        # Test connection
+        client.admin.command('ping')
+        return client
+    except Exception as e:
+        st.error(f"❌ MongoDB Connection Error: {e}")
+        return None
 
-# --- LOGGING ---
 def log_to_db(track, status, id_name, score, forensic, result, meta_json):
-    if supabase:
+    """Logs verification attempts to MongoDB Atlas."""
+    client = get_mongo_client()
+    if client:
         try:
-            # Safe extraction of values with defaults
+            db = client["kyc_database"]        # Your Database Name
+            collection = db["verification_logs"] # Your Collection (Table) Name
+            
+            # Safe extraction of values
             aadhar_name = meta_json.get("qr_name", "N/A")
             aadhar_num = meta_json.get("aadhar_number", "N/A")
             
-            data = {
+            # Prepare the document (No need to stringify JSON for MongoDB!)
+            log_entry = {
+                "timestamp": datetime.now(),
                 "track_type": track,
                 "user_status": status,
-                "extracted_name": id_name,         
-                "aadhar_name": aadhar_name,        
-                "qr_name": aadhar_name,                
-                "aadhar_number": aadhar_num,    
+                "extracted_name": id_name,
+                "aadhar_name": aadhar_name,
+                "qr_name": aadhar_name,
+                "aadhar_number": aadhar_num,
                 "face_match_score": float(score) if score else 0.0,
                 "forensic_status": forensic,
                 "final_result": result,
-                "verification_meta": meta_json     
+                "verification_meta": meta_json  # MongoDB stores this as a real Object/Dict
             }
-            supabase.table("verification_logs").insert(data).execute()
+            
+            collection.insert_one(log_entry)
             return True
         except Exception as e:
-            print(f"DB Log Error: {e}") 
+            print(f"MongoDB Write Error: {e}") 
             return False
     return False
 
-# --- EXTRACTORS ---
+# --- KEEPING YOUR EXISTING EXTRACTORS (No Changes Needed Here) ---
 def smart_correct_digits(text):
     text = text.upper()
     corrections = {'O': '0', 'D': '0', 'Q': '0', 'I': '1', 'L': '1', 'Z': '2', 'S': '5', 'B': '8'}
@@ -109,22 +123,14 @@ def extract_aadhar_qr(image_path):
         except: continue
     return None, None
 
-# --- SIMPLIFIED DATA FETCH (No Number Check) ---
 def get_aadhar_details(front_path, back_path):
-    """
-    Simply extracts Name and Number (if found) from available images.
-    Does NOT return verified status logic.
-    """
-    # 1. Get QR Data
     qr_name, qr_num = None, None
     if back_path: qr_name, qr_num = extract_aadhar_qr(back_path)
     if not qr_name and front_path: qr_name, qr_num = extract_aadhar_qr(front_path)
 
-    # 2. Get OCR Number
     ocr_num = None
     if front_path: ocr_num = extract_aadhar_number_ocr(front_path)
     
-    # 3. Finalize
     final_number = ocr_num if ocr_num else (qr_num if qr_num else "Not Found")
     
     return {
