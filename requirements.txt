@@ -7,4 +7,4 @@ pymongo
 certifi
 scikit-learn
 matplotlib
-pytorch
+torch
