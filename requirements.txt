@@ -5,3 +5,5 @@ pillow
 pytesseract
 pymongo
 certifi
+scikit-learn
+matplotlib
